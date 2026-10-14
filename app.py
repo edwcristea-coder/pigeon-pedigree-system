@@ -1,4 +1,4 @@
-import os, json, hmac, hashlib, secrets, io, html
+import os, json, hmac, hashlib, secrets, io, html, re
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, session, redirect, render_template_string, send_file, abort
@@ -51,7 +51,7 @@ def esc(value):
     return html.escape(str(value if value is not None else ''), quote=True)
 
 STYLE = '''<style>
-*{box-sizing:border-box}body{font:15px system-ui,sans-serif;background:#f3f6fa;color:#17243a;margin:0}header{background:#12365d;color:white;padding:15px max(16px,5%);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}header a{color:white}main{max-width:1150px;margin:25px auto;padding:0 16px}.panel{background:white;border-radius:12px;padding:20px;margin:16px 0;box-shadow:0 2px 12px #17365a14}input,select,textarea{padding:10px;border:1px solid #cbd5e1;border-radius:7px;width:100%;max-width:100%}button,.btn{background:#1674c9;color:white;padding:10px 14px;border:0;border-radius:7px;cursor:pointer;text-decoration:none;display:inline-block}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pigeon{border:1px solid #dce4ed;padding:15px;border-radius:9px}label{display:block;margin:8px 0}label input,label select{display:block;margin-top:5px}.ped-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.ped-col{display:flex;flex-direction:column;gap:5px}.ped-cell{flex:1;min-height:55px;border:1px solid #b9c9d9;border-radius:4px;padding:7px;font-size:12px;overflow-wrap:anywhere}.ped-cell b{display:block;color:#12365d}.ped-cell .note{white-space:pre-wrap;font-size:11px;margin-top:5px;color:#34445b}.ped-col:first-child .ped-cell{display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center}.ped-col:first-child .ped-cell .note{text-align:center}header nav{display:flex;gap:10px;align-items:center;flex-wrap:wrap}header nav .btn{background:#2584e3;color:#fff;font-weight:650}header nav a{text-decoration:none}@media(max-width:680px){header nav{width:100%;justify-content:space-between}header nav a{font-size:13px}}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}@media(max-width:680px){.ped-grid{overflow-x:auto;grid-template-columns:repeat(4,minmax(160px,1fr))}}@media print{header,.no-print{display:none!important}body{background:white}.panel{box-shadow:none}}
+*{box-sizing:border-box}body{font:15px system-ui,sans-serif;background:#f3f6fa;color:#17243a;margin:0}header{background:#12365d;color:white;padding:15px max(16px,5%);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}header a{color:white}main{max-width:1150px;margin:25px auto;padding:0 16px}.panel{background:white;border-radius:12px;padding:20px;margin:16px 0;box-shadow:0 2px 12px #17365a14}input,select,textarea{padding:10px;border:1px solid #cbd5e1;border-radius:7px;width:100%;max-width:100%}button,.btn{background:#1674c9;color:white;padding:10px 14px;border:0;border-radius:7px;cursor:pointer;text-decoration:none;display:inline-block}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pigeon{border:1px solid #dce4ed;padding:15px;border-radius:9px}label{display:block;margin:8px 0}label input,label select{display:block;margin-top:5px}.ped-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.ped-col{display:flex;flex-direction:column;gap:5px}.ped-cell{flex:1;min-height:55px;border:1px solid #b9c9d9;border-radius:4px;padding:7px;font-size:12px;overflow-wrap:anywhere}.ped-cell b{display:block;color:#12365d}.ped-cell .color-picker{width:32px;height:25px;padding:0;border:0;background:transparent;cursor:pointer}.ped-cell .cell-tools{display:flex;justify-content:flex-end;margin-top:auto}.ped-col:first-child .ped-cell .cell-tools{align-self:stretch;justify-content:center}.ped-cell .note{white-space:pre-wrap;font-size:11px;margin-top:5px;color:#34445b}.ped-col:first-child .ped-cell{display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center}.ped-col:first-child .ped-cell .note{text-align:center}header nav{display:flex;gap:10px;align-items:center;flex-wrap:wrap}header nav .btn{background:#2584e3;color:#fff;font-weight:650}header nav a{text-decoration:none}@media(max-width:680px){header nav{width:100%;justify-content:space-between}header nav a{font-size:13px}}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}@media(max-width:680px){.ped-grid{overflow-x:auto;grid-template-columns:repeat(4,minmax(160px,1fr))}}@media print{header,.no-print{display:none!important}body{background:white}.panel{box-shadow:none}}
 </style>'''
 
 
@@ -198,18 +198,29 @@ def pedigree(pid):
         abort(404)
     generations = ancestry(birds,pid)
     cols = ''
-    for i,gen in enumerate(generations):
+    cell_index = 0
+    for i, gen in enumerate(generations):
         cells = ''
         for bird_id in gen:
             p = birds.get(bird_id) if bird_id else None
+            color = safe_hex(request.args.get(f'c{cell_index}', '#f5faff'))
+            picker = (f'<div class="cell-tools no-print"><label style="font-size:10px;color:#64748b">Fundal '
+                      f'<input class="color-picker" type="color" name="c{cell_index}" value="{color}" '
+                      f'oninput="this.closest(\'.ped-cell\').style.backgroundColor=this.value" '
+                      f'title="Alege culoarea chenarului"></label></div>')
             if p:
-                cells += (f'<div class="ped-cell"><b>{esc(p["ring"])} {"("+str(p["year"])+")" if p.get("year") else ""}</b>'
+                cells += (f'<div class="ped-cell" style="background-color:{color}"><b>{esc(p["ring"])} {"("+str(p["year"])+")" if p.get("year") else ""}</b>'
                           f'<div>{esc(p["name"])}</div><div class="muted">{esc(p["color"])} · {esc(p["line"])}</div>'
-                          f'<div class="note">{esc(p.get("notes"))}</div></div>')
+                          f'<div class="note">{esc(p.get("notes"))}</div>{picker}</div>')
             else:
-                cells += '<div class="ped-cell muted">Necunoscut</div>'
+                cells += f'<div class="ped-cell muted" style="background-color:{color}">Necunoscut{picker}</div>'
+            cell_index += 1
         cols += '<div class="ped-col">'+cells+'</div>'
-    return page(f'<div class="toolbar no-print"><a class="btn" href="/pedigree/{pid}/pdf">Descarcă PDF A4</a><a href="/pigeon/{pid}">Înapoi la fișă</a></div><h2>Pedigree – {esc(birds[pid]["ring"])}</h2><section class="panel"><div class="ped-grid">{cols}</div></section>')
+    return page(f'<form action="/pedigree/{pid}/pdf" method="get" target="_blank"><div class="toolbar no-print"><button type="submit">Descarcă PDF A4 cu aceste culori</button><a href="/pigeon/{pid}">Înapoi la fișă</a></div><h2>Pedigree – {esc(birds[pid]["ring"])}</h2><p class="muted no-print">Alege culoarea din fiecare chenar, apoi descarcă PDF-ul. Culorile sunt aplicate și în previzualizare.</p><section class="panel"><div class="ped-grid">{cols}</div></section></form>')
+
+
+def safe_hex(value):
+    return value if isinstance(value, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', value) else '#f5faff'
 
 
 def pdf_font():
@@ -245,8 +256,6 @@ def pedigree_pdf(pid):
     pdf.setFillColorRGB(1,1,1)
     pdf.setFont(bold,21)
     pdf.drawString(35,H-43,'EDW PIGEONS')
-    pdf.setFont(regular,10)
-    pdf.drawString(35,H-65,'PEDIGREE - 4 GENERATII')
     pdf.setFillColorRGB(.07,.21,.36)
     pdf.setFont(bold,12)
     pdf.drawString(35,H-116,'Porumbel: '+short(str(birds[pid]['ring'])+(' ('+str(birds[pid]['year'])+')' if birds[pid].get('year') else ''),45))
@@ -256,6 +265,7 @@ def pedigree_pdf(pid):
     margin=25; gap=5; top=H-174; bottom=55
     colw=(W-2*margin-3*gap)/4
     headers=['PORUMBEL','PARINTI','BUNICI','STRABUNICI']
+    cell_index = 0
     for j,gen in enumerate(gens):
         x=margin+j*(colw+gap)
         pdf.setFillColorRGB(.07,.21,.36)
@@ -266,7 +276,10 @@ def pedigree_pdf(pid):
         for k,bird_id in enumerate(gen):
             y=start-(k+1)*height+2
             pdf.setStrokeColorRGB(.72,.79,.86)
-            pdf.setFillColorRGB(.96,.98,1)
+            hexcolor = safe_hex(request.args.get(f'c{cell_index}', '#f5faff'))
+            rgb = tuple(int(hexcolor[n:n+2],16)/255 for n in (1,3,5))
+            pdf.setFillColorRGB(*rgb)
+            cell_index += 1
             pdf.roundRect(x,y,colw,height-4,4,stroke=1,fill=1)
             p=birds.get(bird_id) if bird_id else None
             pdf.setFillColorRGB(.07,.21,.36)
@@ -316,4 +329,3 @@ def health():
 
 if __name__=='__main__':
     app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
-
