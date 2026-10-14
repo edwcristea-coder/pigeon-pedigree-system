@@ -51,12 +51,14 @@ def esc(value):
     return html.escape(str(value if value is not None else ''), quote=True)
 
 STYLE = '''<style>
-*{box-sizing:border-box}body{font:15px system-ui,sans-serif;background:#f3f6fa;color:#17243a;margin:0}header{background:#12365d;color:white;padding:15px max(16px,5%);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}header a{color:white}main{max-width:1150px;margin:25px auto;padding:0 16px}.panel{background:white;border-radius:12px;padding:20px;margin:16px 0;box-shadow:0 2px 12px #17365a14}input,select,textarea{padding:10px;border:1px solid #cbd5e1;border-radius:7px;width:100%;max-width:100%}button,.btn{background:#1674c9;color:white;padding:10px 14px;border:0;border-radius:7px;cursor:pointer;text-decoration:none;display:inline-block}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pigeon{border:1px solid #dce4ed;padding:15px;border-radius:9px}label{display:block;margin:8px 0}label input,label select{display:block;margin-top:5px}.ped-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.ped-col{display:flex;flex-direction:column;gap:5px}.ped-cell{flex:1;min-height:55px;border:1px solid #b9c9d9;border-radius:4px;padding:7px;font-size:12px;overflow-wrap:anywhere}.ped-cell b{display:block;color:#12365d}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}@media(max-width:680px){.ped-grid{overflow-x:auto;grid-template-columns:repeat(4,minmax(160px,1fr))}}@media print{header,.no-print{display:none!important}body{background:white}.panel{box-shadow:none}}
+*{box-sizing:border-box}body{font:15px system-ui,sans-serif;background:#f3f6fa;color:#17243a;margin:0}header{background:#12365d;color:white;padding:15px max(16px,5%);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}header a{color:white}main{max-width:1150px;margin:25px auto;padding:0 16px}.panel{background:white;border-radius:12px;padding:20px;margin:16px 0;box-shadow:0 2px 12px #17365a14}input,select,textarea{padding:10px;border:1px solid #cbd5e1;border-radius:7px;width:100%;max-width:100%}button,.btn{background:#1674c9;color:white;padding:10px 14px;border:0;border-radius:7px;cursor:pointer;text-decoration:none;display:inline-block}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pigeon{border:1px solid #dce4ed;padding:15px;border-radius:9px}label{display:block;margin:8px 0}label input,label select{display:block;margin-top:5px}.ped-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.ped-col{display:flex;flex-direction:column;gap:5px}.ped-cell{flex:1;min-height:55px;border:1px solid #b9c9d9;border-radius:4px;padding:7px;font-size:12px;overflow-wrap:anywhere}.ped-cell b{display:block;color:#12365d}.ped-cell .note{white-space:pre-wrap;font-size:11px;margin-top:5px;color:#34445b}.ped-col:first-child .ped-cell{display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center}.ped-col:first-child .ped-cell .note{text-align:center}header nav{display:flex;gap:10px;align-items:center;flex-wrap:wrap}header nav .btn{background:#2584e3;color:#fff;font-weight:650}header nav a{text-decoration:none}@media(max-width:680px){header nav{width:100%;justify-content:space-between}header nav a{font-size:13px}}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}@media(max-width:680px){.ped-grid{overflow-x:auto;grid-template-columns:repeat(4,minmax(160px,1fr))}}@media print{header,.no-print{display:none!important}body{background:white}.panel{box-shadow:none}}
 </style>'''
 
 
 def page(body):
-    return render_template_string('<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EDW Pigeons</title>'+STYLE+'</head><body><header><strong>EDW PIGEONS</strong><nav><a href="/">Porumbei</a> &nbsp; <a href="/export">Export backup</a> &nbsp; <a href="/logout">Delogare</a></nav></header><main>'+body+'</main></body></html>')
+    if request.path == '/login':
+        body = '<style>header nav{display:none!important}</style>' + body
+    return render_template_string('<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EDW Pigeons</title>'+STYLE+'</head><body><header><strong>EDW PIGEONS</strong><nav><a href="/">Evidență</a><a class="btn" href="/pigeon/new">+ Adaugă porumbel</a><a href="/export">Backup</a><a href="/logout">Delogare</a></nav></header><main>'+body+'</main></body></html>')
 
 
 @app.get('/login')
@@ -201,7 +203,9 @@ def pedigree(pid):
         for bird_id in gen:
             p = birds.get(bird_id) if bird_id else None
             if p:
-                cells += f'<div class="ped-cell"><b>{esc(p["ring"])}</b>{esc(p["name"])}<div class="muted">{esc(p["color"])} · {esc(p["line"])}</div></div>'
+                cells += (f'<div class="ped-cell"><b>{esc(p["ring"])} {"("+str(p["year"])+")" if p.get("year") else ""}</b>'
+                          f'<div>{esc(p["name"])}</div><div class="muted">{esc(p["color"])} · {esc(p["line"])}</div>'
+                          f'<div class="note">{esc(p.get("notes"))}</div></div>')
             else:
                 cells += '<div class="ped-cell muted">Necunoscut</div>'
         cols += '<div class="ped-col">'+cells+'</div>'
@@ -245,7 +249,7 @@ def pedigree_pdf(pid):
     pdf.drawString(35,H-65,'PEDIGREE - 4 GENERATII')
     pdf.setFillColorRGB(.07,.21,.36)
     pdf.setFont(bold,12)
-    pdf.drawString(35,H-116,'Porumbel: '+short(birds[pid]['ring'],45))
+    pdf.drawString(35,H-116,'Porumbel: '+short(str(birds[pid]['ring'])+(' ('+str(birds[pid]['year'])+')' if birds[pid].get('year') else ''),45))
     pdf.setFont(regular,9)
     pdf.drawString(35,H-133,'Crescator: '+short(birds[pid].get('breeder'),48))
     pdf.drawString(35,H-148,'Proprietar: '+short(birds[pid].get('owner'),48))
@@ -267,16 +271,26 @@ def pedigree_pdf(pid):
             p=birds.get(bird_id) if bird_id else None
             pdf.setFillColorRGB(.07,.21,.36)
             if p:
-                maxchars=18 if j==3 else 21
-                lines=[(bold,7.2,short(p.get('ring'),maxchars)),(regular,6.5,short(p.get('name'),maxchars)),(regular,6.2,short(p.get('color'),maxchars)),(regular,6.2,short(p.get('line'),maxchars))]
+                maxchars=19 if j==3 else 24
+                ring = str(p.get('ring') or '') + (' ('+str(p['year'])+')' if p.get('year') else '')
+                entries = [(bold,7.2,ring), (regular,6.4,p.get('name') or ''),
+                           (regular,6.1,' · '.join(filter(None,[p.get('color'),p.get('line')])))]
+                if p.get('notes'):
+                    entries.extend((regular,5.8,t) for t in str(p['notes']).splitlines() if t.strip())
+                available = height-14
+                maxlines = max(1,int(available//9))
+                entries = [(font,size,short(value,maxchars)) for font,size,value in entries if value][:maxlines]
             else:
-                lines=[(regular,7,'Necunoscut')]
-            yy=y+height-17
-            for font,size,value in lines:
-                if yy<y+5:break
+                entries=[(regular,7,'Necunoscut')]
+            yy = y+(height-4)/2 + (len(entries)-1)*4.5 if j==0 else y+height-17
+            for font,size,value in entries:
+                if yy < y+5: break
                 pdf.setFont(font,size)
-                pdf.drawString(x+5,yy,value)
-                yy-=10
+                if j==0:
+                    pdf.drawCentredString(x+colw/2,yy,value)
+                else:
+                    pdf.drawString(x+5,yy,value)
+                yy -= 9
     pdf.setFillColorRGB(.4,.45,.52)
     pdf.setFont(regular,8)
     pdf.drawString(margin,25,'Generat cu EDW Pigeons')
@@ -302,3 +316,4 @@ def health():
 
 if __name__=='__main__':
     app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
+
