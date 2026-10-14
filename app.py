@@ -23,28 +23,105 @@ def db():
     return psycopg.connect(os.environ['DATABASE_URL'], row_factory=dict_row)
 
 
+def password_hash(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 260000)
+    return salt.hex() + '$' + digest.hex()
+
+
+def verify_hash(password, stored):
+    try:
+        salt, digest = stored.split('$', 1)
+        actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 260000)
+        return hmac.compare_digest(actual.hex(), digest)
+    except (ValueError, TypeError):
+        return False
+
+
 def init():
+    # Idempotent migration: legacy pigeons/revisions are assigned to the owner.
     with db() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS pigeons (id BIGSERIAL PRIMARY KEY, ring TEXT NOT NULL UNIQUE, year INTEGER, sex TEXT, color TEXT, breeder TEXT, owner TEXT, name TEXT, line TEXT, notes TEXT, father_id BIGINT REFERENCES pigeons(id) ON DELETE SET NULL, mother_id BIGINT REFERENCES pigeons(id) ON DELETE SET NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS revisions (id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT now(), action TEXT NOT NULL, pigeon_id BIGINT, snapshot JSONB NOT NULL)''')
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL, is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+            active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pigeons (id BIGSERIAL PRIMARY KEY, ring TEXT NOT NULL UNIQUE, year INTEGER, sex TEXT, color TEXT, breeder TEXT, owner TEXT, name TEXT, line TEXT, notes TEXT, father_id BIGINT REFERENCES pigeons(id) ON DELETE SET NULL, mother_id BIGINT REFERENCES pigeons(id) ON DELETE SET NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS revisions (id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT now(), action TEXT NOT NULL, pigeon_id BIGINT, snapshot JSONB NOT NULL)""")
+        c.execute('ALTER TABLE pigeons ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id)')
+        c.execute('ALTER TABLE revisions ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id)')
+        # Keep the original Render credentials as the owner's login.
+        if not PASSWORD_HASH:
+            raise RuntimeError('APP_PASSWORD_HASH lipseste din Render')
+        owner = c.execute('SELECT id FROM users WHERE username=%s', (USERNAME,)).fetchone()
+        if owner is None:
+            owner = c.execute('INSERT INTO users(username,password_hash,is_admin) VALUES (%s,%s,TRUE) RETURNING id', (USERNAME, PASSWORD_HASH)).fetchone()
+        owner_id = owner['id']
+        c.execute('SELECT set_config(%s,%s,true)', ('app.user_id',str(owner_id)))
+        c.execute('UPDATE users SET is_admin=TRUE WHERE id=%s', (owner_id,))
+        c.execute('UPDATE pigeons SET user_id=%s WHERE user_id IS NULL', (owner_id,))
+        c.execute('UPDATE revisions SET user_id=%s WHERE user_id IS NULL', (owner_id,))
+        c.execute('ALTER TABLE pigeons ALTER COLUMN user_id SET NOT NULL')
+        c.execute('ALTER TABLE revisions ALTER COLUMN user_id SET NOT NULL')
+        # Old unique ring index was global; replace with unique ring per user.
+        c.execute("""DO $$ DECLARE r record; BEGIN
+            FOR r IN SELECT conname FROM pg_constraint
+                     WHERE conrelid='pigeons'::regclass AND contype='u'
+                       AND pg_get_constraintdef(oid)='UNIQUE (ring)'
+            LOOP EXECUTE format('ALTER TABLE pigeons DROP CONSTRAINT %I',r.conname); END LOOP;
+            END $$""")
+        c.execute('CREATE UNIQUE INDEX IF NOT EXISTS pigeons_user_ring_unique ON pigeons(user_id,ring)')
+        c.execute('CREATE INDEX IF NOT EXISTS pigeons_user_idx ON pigeons(user_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS revisions_user_idx ON revisions(user_id)')
+        # DB-enforced tenant isolation for all statements, including accidental unfiltered SELECTs.
+        for table in ('pigeons', 'revisions'):
+            c.execute(f'ALTER TABLE {table} ENABLE ROW LEVEL SECURITY')
+            c.execute(f'ALTER TABLE {table} FORCE ROW LEVEL SECURITY')
+            c.execute(f"DROP POLICY IF EXISTS tenant_scope ON {table}")
+            c.execute(f"""CREATE POLICY tenant_scope ON {table}
+                USING (user_id = NULLIF(current_setting('app.user_id',true),'')::bigint)
+                WITH CHECK (user_id = NULLIF(current_setting('app.user_id',true),'')::bigint)""")
+
+
+def tenant_db():
+    c = db()
+    c.execute('SELECT set_config(%s,%s,true)', ('app.user_id', str(session['user_id'])))
+    return c
+
+
+def csrf_token():
+    if 'csrf' not in session:
+        session['csrf'] = secrets.token_urlsafe(32)
+    return session['csrf']
+
+
+def check_csrf():
+    if not hmac.compare_digest(request.form.get('csrf', ''), session.get('csrf', '')):
+        abort(403)
 
 
 def auth(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        if not session.get('authenticated'):
+        if not session.get('authenticated') or not session.get('user_id'):
             return redirect('/login')
+        with db() as c:
+            user = c.execute('SELECT id,is_admin,active FROM users WHERE id=%s', (session['user_id'],)).fetchone()
+        if not user or not user['active']:
+            session.clear()
+            return redirect('/login')
+        session['is_admin'] = user['is_admin']
         return f(*args, **kwargs)
     return wrapped
 
 
-def check_password(password):
-    try:
-        salt, digest = PASSWORD_HASH.split('$', 1)
-        actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 260000)
-        return hmac.compare_digest(actual.hex(), digest)
-    except (ValueError, TypeError):
-        return False
+def admin_only(f):
+    @wraps(f)
+    @auth
+    def wrapped(*args, **kwargs):
+        if not session.get('is_admin'):
+            abort(403)
+        return f(*args, **kwargs)
+    return wrapped
 
 
 def esc(value):
@@ -58,19 +135,29 @@ STYLE = '''<style>
 def page(body):
     if request.path == '/login':
         body = '<style>header nav{display:none!important}</style>' + body
-    return render_template_string('<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EDW Pigeons</title>'+STYLE+'</head><body><header><strong>EDW PIGEONS</strong><nav><a href="/">Evidență</a><a class="btn" href="/pigeon/new">+ Adaugă porumbel</a><a href="/export">Backup</a><a href="/logout">Delogare</a></nav></header><main>'+body+'</main></body></html>')
+    return render_template_string('<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EDW Pigeons</title>'+STYLE+'</head><body><header><strong>EDW PIGEONS</strong><nav><a href="/">Evidență</a><a class="btn" href="/pigeon/new">+ Adaugă porumbel</a><a href="/export">Backup</a>' + ('<a href="/admin/users">Utilizatori</a>' if session.get('is_admin') else '') + '<a href="/logout">Delogare</a></nav></header><main>'+body+'</main></body></html>')
 
 
 @app.get('/login')
 def login_form():
-    return page('<section class="panel" style="max-width:400px;margin:60px auto"><h2>Autentificare</h2><form method="post"><label>Utilizator<input name="username" required autocomplete="username"></label><label>Parolă<input name="password" type="password" required autocomplete="current-password"></label><button>Intră</button></form></section>')
+    init()
+    return page(f'<section class="panel" style="max-width:400px;margin:60px auto"><h2>Autentificare</h2><form method="post"><input type="hidden" name="csrf" value="{esc(csrf_token())}"><label>Utilizator<input name="username" required autocomplete="username"></label><label>Parolă<input name="password" type="password" required autocomplete="current-password"></label><button>Intră</button></form></section>')
 
 
 @app.post('/login')
 def login():
-    if hmac.compare_digest(request.form.get('username', ''), USERNAME) and check_password(request.form.get('password', '')):
+    init()
+    check_csrf()
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    with db() as c:
+        user = c.execute('SELECT * FROM users WHERE username=%s', (username,)).fetchone()
+    if user and user['active'] and (verify_hash(password, PASSWORD_HASH) if username == USERNAME else verify_hash(password, user['password_hash'])):
         session.clear()
         session['authenticated'] = True
+        session['user_id'] = user['id']
+        session['is_admin'] = user['is_admin']
+        csrf_token()
         return redirect('/')
     return page('<section class="panel">Date de autentificare incorecte. <a href="/login">Încearcă din nou</a>.</section>'), 401
 
@@ -86,11 +173,11 @@ def logout():
 def home():
     init()
     q = request.args.get('q', '').strip()
-    with db() as c:
+    with tenant_db() as c:
         if q:
-            birds = c.execute('SELECT * FROM pigeons WHERE ring ILIKE %s OR name ILIKE %s OR line ILIKE %s ORDER BY year DESC NULLS LAST,ring', tuple(['%'+q+'%']*3)).fetchall()
+            birds = c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint AND (ring ILIKE %s OR name ILIKE %s OR line ILIKE %s) ORDER BY year DESC NULLS LAST,ring', tuple(['%'+q+'%']*3)).fetchall()
         else:
-            birds = c.execute('SELECT * FROM pigeons ORDER BY year DESC NULLS LAST,ring').fetchall()
+            birds = c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint ORDER BY year DESC NULLS LAST,ring').fetchall()
     cards = ''.join(f'<div class="pigeon"><b>{esc(p["ring"])}</b><p>{esc(p["name"])} · {esc(p["sex"])} · {esc(p["color"])}</p><a href="/pigeon/{p["id"]}">Editează</a> &nbsp; <a href="/pedigree/{p["id"]}">Pedigree</a></div>' for p in birds)
     return page(f'<h1>Evidența crescătoriei</h1><p>{len(birds)} porumbei afișați</p><div class="toolbar"><a class="btn" href="/pigeon/new">+ Adaugă porumbel</a><form method="get" class="toolbar"><input name="q" placeholder="Caută inel, nume, linie" value="{esc(q)}" style="width:260px"><button>Caută</button><a href="/">Resetează</a></form></div><section class="panel"><div class="grid">{cards or "Nu există porumbei pentru această căutare."}</div></section>')
 
@@ -149,9 +236,9 @@ def attach_bird(c, birds, root, slot, chosen):
         return 'Sexul porumbelului existent nu corespunde poziției.'
     if creates_cycle(birds, parent, chosen) or chosen == parent:
         return 'Legătură genealogică circulară.'
-    c.execute(f'UPDATE pigeons SET {edge}=%s WHERE id=%s', (chosen, parent))
-    snap = c.execute('SELECT * FROM pigeons WHERE id=%s', (parent,)).fetchone()
-    c.execute('INSERT INTO revisions(action,pigeon_id,snapshot) VALUES (%s,%s,%s::jsonb)',
+    c.execute(f'UPDATE pigeons SET {edge}=%s WHERE id=%s AND user_id=current_setting($$app.user_id$$)::bigint', (chosen, parent))
+    snap = c.execute('SELECT * FROM pigeons WHERE id=%s AND user_id=current_setting($$app.user_id$$)::bigint', (parent,)).fetchone()
+    c.execute('INSERT INTO revisions(action,pigeon_id,snapshot,user_id) VALUES (%s,%s,%s::jsonb,current_setting($$app.user_id$$)::bigint)',
               ('attach', parent, json.dumps(snap, default=str)))
     return None
 
@@ -160,16 +247,15 @@ def attach_bird(c, birds, root, slot, chosen):
 @auth
 def pedigree_slot(root, slot):
     init()
-    with db() as c:
-        birds = {b['id']: b for b in c.execute('SELECT * FROM pigeons').fetchall()}
+    with tenant_db() as c:
+        birds = {b['id']: b for b in c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
         parent, edge = slot_parent(birds, root, slot)
         if parent is None:
             return page('<section class="panel">Completează mai întâi generația anterioară. '
                         f'<a href="{context_url(root,slot)}">Înapoi la pedigree</a></section>'), 400
         current = birds[parent].get(edge)
         if request.method == 'POST':
-            if request.form.get('csrf') != session.get('csrf'):
-                abort(403)
+            check_csrf()
             try:
                 chosen = int(request.form.get('existing', ''))
             except ValueError:
@@ -203,8 +289,9 @@ def pigeon(key):
     ctx = pedigree_context()
     if key != 'new' and not key.isdigit():
         abort(404)
-    with db() as c:
+    with tenant_db() as c:
         if request.method == 'POST':
+            check_csrf()
             fields = ['ring','name','year','sex','color','breeder','owner','line','notes','father_id','mother_id']
             d = {k: (request.form.get(k, '').strip() or None) for k in fields}
             if not d['ring']:
@@ -215,11 +302,17 @@ def pigeon(key):
                         d[k] = int(d[k])
                     except ValueError:
                         return 'Valoare numerică invalidă', 400
+            if ctx and key == 'new':
+                root, slot = ctx
+                ctxbirds = {b['id']:b for b in c.execute('SELECT id,father_id,mother_id FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
+                par, edge = slot_parent(ctxbirds, root, slot)
+                if par is None: abort(400)
+                if d['sex'] != ('M' if edge == 'father_id' else 'F'): return 'Sexul nu corespunde poziției genealogice',400
             if d['sex'] not in (None,'M','F'):
                 return 'Sex invalid', 400
             if d['father_id'] and d['father_id'] == d['mother_id']:
                 return 'Părinții trebuie să fie diferiți', 400
-            birds = {b['id']:b for b in c.execute('SELECT id, father_id, mother_id, sex FROM pigeons').fetchall()}
+            birds = {b['id']:b for b in c.execute('SELECT id, father_id, mother_id, sex FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
             pid = None if key == 'new' else int(key)
             if pid is not None and pid not in birds:
                 abort(404)
@@ -233,32 +326,32 @@ def pigeon(key):
                 if key == 'new':
                     cols = ','.join(fields)
                     placeholders = ','.join(['%s']*len(fields))
-                    pid = c.execute(f'INSERT INTO pigeons ({cols}) VALUES ({placeholders}) RETURNING id',list(d.values())).fetchone()['id']
+                    pid = c.execute(f'INSERT INTO pigeons ({cols},user_id) VALUES ({placeholders},current_setting($$app.user_id$$)::bigint) RETURNING id',list(d.values())).fetchone()['id']
                     action = 'create'
                 else:
                     sets = ','.join(f'{k}=%s' for k in fields)
-                    c.execute(f'UPDATE pigeons SET {sets} WHERE id=%s',list(d.values())+[pid])
+                    c.execute(f'UPDATE pigeons SET {sets} WHERE id=%s AND user_id=current_setting($$app.user_id$$)::bigint',list(d.values())+[pid])
                     action = 'update'
-                snapshot = c.execute('SELECT * FROM pigeons WHERE id=%s',(pid,)).fetchone()
-                c.execute('INSERT INTO revisions (action,pigeon_id,snapshot) VALUES (%s,%s,%s::jsonb)',(action,pid,json.dumps(snapshot,default=str)))
+                snapshot = c.execute('SELECT * FROM pigeons WHERE id=%s AND user_id=current_setting($$app.user_id$$)::bigint',(pid,)).fetchone()
+                c.execute('INSERT INTO revisions (action,pigeon_id,snapshot,user_id) VALUES (%s,%s,%s::jsonb,current_setting($$app.user_id$$)::bigint)',(action,pid,json.dumps(snapshot,default=str)))
             except UniqueViolation:
                 return 'Seria inelului există deja în baza de date',409
             if ctx:
                 root, slot = ctx
-                allbirds = {b['id']: b for b in c.execute('SELECT * FROM pigeons').fetchall()}
+                allbirds = {b['id']: b for b in c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
                 if key == 'new':
                     error = attach_bird(c, allbirds, root, slot, pid)
                     if error:
                         return page(f'<section class="panel">Porumbel salvat, dar asocierea nu a reușit: {esc(error)}</section>'),400
                 return redirect(context_url(root, slot))
             return redirect(f'/pigeon/{pid}')
-        p = c.execute('SELECT * FROM pigeons WHERE id=%s',(int(key),)).fetchone() if key!='new' else {}
+        p = c.execute('SELECT * FROM pigeons WHERE id=%s AND user_id=current_setting($$app.user_id$$)::bigint',(int(key),)).fetchone() if key!='new' else {}
         if key!='new' and not p:
             abort(404)
-        birds = c.execute('SELECT id,ring,sex FROM pigeons ORDER BY ring').fetchall()
+        birds = c.execute('SELECT id,ring,sex FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint ORDER BY ring').fetchall()
         if key == 'new' and ctx:
             root, slot = ctx
-            allbirds = {b['id']: b for b in c.execute('SELECT * FROM pigeons').fetchall()}
+            allbirds = {b['id']: b for b in c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
             parent, edge = slot_parent(allbirds, root, slot)
             if parent is None:
                 return 'Completează mai întâi generația anterioară',400
@@ -284,7 +377,7 @@ def pigeon(key):
     else:
         ctx_action = url_for('pigeon', key=key)
         extra = ''
-    return page(f'<h2>{"Adaugă" if key=="new" else "Editează"} porumbel</h2><section class="panel"><form method="post" action="{ctx_action}"><div class="grid">{fields}</div><button>Salvează</button></form>{link}{extra}</section>')
+    return page(f'<h2>{"Adaugă" if key=="new" else "Editează"} porumbel</h2><section class="panel"><form method="post" action="{ctx_action}"><input type="hidden" name="csrf" value="{esc(csrf_token())}"><div class="grid">{fields}</div><button>Salvează</button></form>{link}{extra}</section>')
 
 
 def ancestry(birds, pid):
@@ -302,8 +395,8 @@ def ancestry(birds, pid):
 @auth
 def pedigree(pid):
     init()
-    with db() as c:
-        birds = {p['id']:p for p in c.execute('SELECT * FROM pigeons').fetchall()}
+    with tenant_db() as c:
+        birds = {p['id']:p for p in c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
     if pid not in birds:
         abort(404)
     generations = ancestry(birds,pid)
@@ -323,7 +416,7 @@ def pedigree(pid):
                 target = url_for('pedigree_slot', root=pid, slot=cell_index)
                 cell_link = f'<a class="no-print" href="{target}" style="display:block;margin-top:7px;font-size:11px;font-weight:600">✎ {"Editează / schimbă" if p else "+ Adaugă / selectează"}</a>'
             else:
-                cell_link = f'<a class="no-print" href="{url_for("pigeon",key=str(pid),root=pid,slot=1)}" style="font-size:11px">Editează fișa</a>'
+                cell_link = f'<a class="no-print" href="{url_for("pigeon",key=str(pid))}" style="font-size:11px">Editează fișa</a>'
             if p:
                 cells += (f'<div class="ped-cell" id="cell-{cell_index}" style="background-color:{color}"><b>{esc(p["ring"])} {"("+str(p["year"])+")" if p.get("year") else ""}</b>'
                           f'<div>{esc(p["name"])}</div><div class="muted">{esc(p["color"])} · {esc(p["line"])}</div>'
@@ -366,8 +459,8 @@ def short(s,n=35):
 @auth
 def pedigree_pdf(pid):
     init()
-    with db() as c:
-        birds = {p['id']:p for p in c.execute('SELECT * FROM pigeons').fetchall()}
+    with tenant_db() as c:
+        birds = {p['id']:p for p in c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint').fetchall()}
     if pid not in birds:
         abort(404)
     gens = ancestry(birds,pid)
@@ -440,10 +533,67 @@ def pedigree_pdf(pid):
 @auth
 def export():
     init()
-    with db() as c:
-        data={'exported_at':datetime.now(timezone.utc).isoformat(),'pigeons':c.execute('SELECT * FROM pigeons ORDER BY id').fetchall(),'revisions':c.execute('SELECT * FROM revisions ORDER BY id').fetchall()}
+    with tenant_db() as c:
+        data={'exported_at':datetime.now(timezone.utc).isoformat(),'pigeons':c.execute('SELECT * FROM pigeons WHERE user_id=current_setting($$app.user_id$$)::bigint ORDER BY id').fetchall(),'revisions':c.execute('SELECT * FROM revisions WHERE user_id=current_setting($$app.user_id$$)::bigint ORDER BY id').fetchall()}
     blob=json.dumps(data,default=str,ensure_ascii=False,indent=2).encode('utf-8')
     return send_file(io.BytesIO(blob),mimetype='application/json',as_attachment=True,download_name='edw-pigeons-backup.json')
+
+
+@app.route('/admin/users', methods=['GET', 'POST'])
+@admin_only
+def manage_users():
+    init()
+    message = ''
+    if request.method == 'POST':
+        check_csrf()
+        action = request.form.get('action')
+        with db() as c:
+            if action == 'create':
+                username = request.form.get('username', '').strip()
+                password = request.form.get('password', '')
+                if not re.fullmatch(r'[A-Za-z0-9_.-]{3,40}', username) or len(password) < 12:
+                    message = 'Utilizator invalid sau parola prea scurtă (minimum 12 caractere).'
+                else:
+                    try:
+                        c.execute('INSERT INTO users(username,password_hash) VALUES (%s,%s)', (username,password_hash(password)))
+                        message = 'Cont creat.'
+                    except UniqueViolation:
+                        message = 'Acest nume de utilizator există deja.'
+            elif action == 'toggle':
+                try:
+                    uid = int(request.form.get('id',''))
+                except ValueError:
+                    abort(400)
+                if uid == session['user_id']:
+                    abort(400)
+                c.execute('UPDATE users SET active=NOT active WHERE id=%s AND is_admin=FALSE', (uid,))
+                message = 'Starea contului a fost schimbată.'
+            elif action == 'reset':
+                try:
+                    uid = int(request.form.get('id',''))
+                except ValueError:
+                    abort(400)
+                password = request.form.get('password', '')
+                if len(password) < 12 or uid == session['user_id']:
+                    abort(400)
+                c.execute('UPDATE users SET password_hash=%s WHERE id=%s AND is_admin=FALSE', (password_hash(password),uid))
+                message = 'Parola utilizatorului a fost schimbată.'
+            else:
+                abort(400)
+    with db() as c:
+        users = c.execute('SELECT id,username,is_admin,active,created_at FROM users ORDER BY id').fetchall()
+    token = esc(csrf_token())
+    rows = ''
+    for u in users:
+        if u['is_admin']:
+            rows += f'<div class="pigeon"><b>{esc(u["username"])}</b> – Administrator</div>'
+            continue
+        rows += f'''<div class="pigeon"><b>{esc(u["username"])}</b> – {'Activ' if u['active'] else 'Dezactivat'}
+            <form method="post"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="toggle"><input type="hidden" name="id" value="{u['id']}"><button>{'Dezactivează' if u['active'] else 'Activează'}</button></form>
+            <form method="post"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="reset"><input type="hidden" name="id" value="{u['id']}"><label>Parolă nouă (min. 12)<input type="password" name="password" minlength="12" required></label><button>Schimbă parola</button></form></div>'''
+    return page(f'''<h1>Administrare utilizatori</h1><p>{esc(message)}</p>
+        <section class="panel"><h2>Adaugă utilizator</h2><form method="post"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="create"><label>Utilizator<input name="username" minlength="3" maxlength="40" required></label><label>Parolă (minimum 12 caractere)<input type="password" name="password" minlength="12" required></label><button>Creează cont</button></form></section>
+        <section class="panel"><h2>Conturi</h2><div class="grid">{rows}</div></section>''')
 
 
 @app.get('/health')
